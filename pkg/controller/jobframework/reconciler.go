@@ -86,6 +86,7 @@ var (
 	ErrNoMatchingWorkloads            = errors.New("no matching workloads")
 	ErrExtraWorkloads                 = errors.New("extra workloads")
 	ErrPrebuiltWorkloadNotFound       = errors.New("prebuilt workload not found")
+	errPrebuiltWorkloadNotYetInSync   = errors.New("prebuilt workload not yet in sync with its user job")
 )
 
 type WorkloadRetentionPolicy struct {
@@ -1216,11 +1217,33 @@ func (r *JobReconciler) ensurePrebuiltWorkloadInSync(ctx context.Context, wl *ku
 		if err != nil {
 			return false, err
 		}
+		// Requeue if the job is only waiting for admission to propagate, rather than
+		// finishing a workload that will still converge.
+		if pending, perr := prebuiltWorkloadAwaitingAdmission(ctx, r.client, job, wl); perr != nil {
+			return false, perr
+		} else if pending {
+			return false, errPrebuiltWorkloadNotYetInSync
+		}
 		// mark the workload as finished
 		msg := "The prebuilt workload is out of sync with its user job"
 		return false, workloadfinish.Finish(ctx, r.client, wl, kueue.WorkloadFinishedReasonOutOfSync, msg, r.clock)
 	}
 	return true, nil
+}
+
+// prebuiltWorkloadAwaitingAdmission reports whether a non-equivalent prebuilt workload
+// is only waiting for its admission to propagate to the job: the workload is admitted
+// and the job still matches its declared pod sets.
+func prebuiltWorkloadAwaitingAdmission(ctx context.Context, c client.Client, job GenericJob, wl *kueue.Workload) (bool, error) {
+	if !workload.HasQuotaReservation(wl) {
+		return false, nil
+	}
+	getPodSets, err := JobPodSets(ctx, job, c)
+	if err != nil {
+		return false, err
+	}
+	jobPodSets := clearMinCountsIfFeatureDisabled(getPodSets)
+	return equality.ComparePodSetSlices(jobPodSets, wl.Spec.PodSets, equality.WithIgnoreTolerations()), nil
 }
 
 // expectedRunningPodSets gets the expected podsets during the job execution, returns nil if the workload has no reservation or
